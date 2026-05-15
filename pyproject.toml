@@ -1,0 +1,58 @@
+[project]
+name = "mapache-agent"
+version = "0.3.6"
+description = "AI‑assistant‑as‑Makefile: a tool to create and manage AI agents using a Makefile."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [
+    { name = "Dmitriy Sorochenkov" },
+]
+keywords = ["ai", "agent", "makefile", "llm", "automation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "any-llm-sdk[openai,anthropic,ollama,openrouter]==1.13.0",
+    "pyyaml>=6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8.5",
+]
+
+[project.scripts]
+mapache_agent = "mapache_agent.main:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project.urls]
+Homepage = "https://github.com/dmtr/mapache-agent"
+Repository = "https://github.com/dmtr/mapache-agent"
+Issues = "https://github.com/dmtr/mapache-agent/issues"
+
+[tool.setuptools.package-data]
+mapache_agent = ["templates/*.md"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "e2e: end-to-end tests that call the real API (skipped by default; pass --e2e to run)",
+]
+
+[tool.ruff.lint]
+ignore = ["E741"]

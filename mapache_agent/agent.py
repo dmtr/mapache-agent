@@ -1,0 +1,508 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncGenerator, NamedTuple
+from uuid import uuid4
+
+import any_llm
+from any_llm.types.completion import (
+    ChatCompletionMessageFunctionToolCall,
+    ChatCompletionMessageToolCall,
+    Function,
+)
+
+from mapache_agent.app_dirs import default_skills_dir, project_dir
+from mapache_agent.builtin_tools import BUILTIN_SCHEMAS, get_builtin_tools, get_memory_schemas
+from mapache_agent.commands import export_conversation
+from mapache_agent.memory import Memory
+from mapache_agent.skill_registry import SkillRegistry
+
+_DEFAULT_MAX_RETRIES = 5
+_DEFAULT_TOOL_TIMEOUT = 600  # seconds
+_DEFAULT_MAX_TOOL_OUTPUT = 16000  # characters; 0 = unlimited
+_DEFAULT_MAX_TOKENS = 4096
+_DEFAULT_REASONING_EFFORT = "auto"
+_MAX_REPEATED_FAILURES = 8
+_MAX_MODEL_TURNS_PER_REQUEST = 64
+_MAX_TOOL_CALLS_PER_REQUEST = 256
+_MAX_RUN_SECONDS_PER_REQUEST = 900
+
+logger = logging.getLogger(__name__)
+
+
+class _ToolResult(NamedTuple):
+    is_error: bool
+    output: str
+
+
+def _tool_output(text: str, max_output: int = 0) -> _ToolResult:
+    """Format a successful tool output with optional truncation."""
+    out = text.strip() or "OK. Execution succeeded with no output."
+    if max_output > 0 and len(out) > max_output:
+        omitted = len(out) - max_output
+        notice = f"(Output was truncated, {omitted} omitted_chars)"
+        if len(notice) >= max_output:
+            out = notice[:max_output]
+        else:
+            out = out[: max_output - len(notice)] + notice
+    return _ToolResult(is_error=False, output=out)
+
+
+def _tool_error(msg: str, max_output: int = 0) -> _ToolResult:
+    out = f"ERROR: {msg}"
+    if max_output > 0 and len(out) > max_output:
+        out = out[:max_output]
+    return _ToolResult(is_error=True, output=out)
+
+
+@dataclass
+class TokenEvent:
+    """A partial text token streamed from the LLM."""
+
+    text: str
+
+
+@dataclass
+class ToolStartEvent:
+    """Emitted just before a tool call is executed."""
+
+    name: str
+    args: dict
+
+
+@dataclass
+class ToolDoneEvent:
+    """Emitted after a tool call completes."""
+
+    name: str
+    output: str
+    is_error: bool
+
+
+@dataclass
+class DoneEvent:
+    """Emitted once the agent has a final text response (no more tool calls)."""
+
+    content: str
+
+
+AgentEvent = TokenEvent | ToolStartEvent | ToolDoneEvent | DoneEvent
+
+
+class AgentConfig(NamedTuple):
+    system_prompt: str
+    model: str
+    max_retries: int = _DEFAULT_MAX_RETRIES
+    tool_timeout: int = _DEFAULT_TOOL_TIMEOUT
+    max_tool_output: int = _DEFAULT_MAX_TOOL_OUTPUT
+    max_tokens: int = _DEFAULT_MAX_TOKENS
+    skills_dir: str | None = None
+    disabled_builtin_tools: frozenset[str] = frozenset()
+    reasoning_effort: str = _DEFAULT_REASONING_EFFORT
+    session_id: str | None = None
+
+
+def _parse_retry_after(e: any_llm.RateLimitError) -> float | None:
+    """Return the wait time in seconds from a RateLimitError's response headers.
+
+    Checks ``retry-after-ms`` (milliseconds) then ``retry-after`` (seconds).
+    Returns ``None`` when neither header is present.
+    """
+    try:
+        orig = e.original_exception
+        headers = orig.response.headers if orig is not None and hasattr(orig, "response") and orig.response is not None else {}
+    except Exception:
+        return None
+    if ms := headers.get("retry-after-ms"):
+        return float(ms) / 1000
+    if sec := headers.get("retry-after"):
+        return float(sec)
+    return None
+
+
+async def _acompletion_with_retry(
+    model: str,
+    messages: list[dict],
+    tool_kwargs: dict[str, Any],
+    max_retries: int,
+    max_tokens: int = _DEFAULT_MAX_TOKENS,
+    reasoning_effort: str = _DEFAULT_REASONING_EFFORT,
+) -> Any:
+    """Call ``any_llm.acompletion`` with streaming, retrying on rate limit.
+
+    On each ``RateLimitError`` the wait time is read from the ``Retry-After``
+    response header when present, otherwise exponential backoff is used
+    (``2^attempt`` seconds, capped at 60 s).  A message is printed before
+    each retry so the user can see what is happening.
+
+    Returns an ``AsyncIterator[ChatCompletionChunk]``.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return await any_llm.acompletion(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                stream=True,
+                stream_options={"include_usage": True},
+                **tool_kwargs,
+            )
+        except any_llm.RateLimitError as e:
+            if attempt == max_retries:
+                raise
+            wait = _parse_retry_after(e) or min(2**attempt, 60)
+            print(
+                f"Rate limited, retrying in {wait:.0f}s" f" (attempt {attempt + 1}/{max_retries})...",
+                flush=True,
+            )
+            await asyncio.sleep(wait)
+
+
+def _parse_item(doc: Any) -> ChatCompletionMessageToolCall | None:
+    result: list[ChatCompletionMessageToolCall] = []
+    for item in doc:
+        if not isinstance(item, dict) or item.get("type") != "function":
+            return None
+        func = item.get("function", {})
+        if "name" not in func:
+            return None
+        args = func.get("arguments", {})
+        args_str = json.dumps(args) if isinstance(args, dict) else args
+        result.append(
+            ChatCompletionMessageFunctionToolCall(
+                id=item.get("id", ""),
+                type="function",
+                function=Function(name=func["name"], arguments=args_str),
+            )
+        )
+    return result
+
+
+def _parse_content_tool_calls(content: str) -> list[ChatCompletionMessageToolCall] | None:
+    """Parse tool calls embedded in message content (e.g. Gemma-style responses).
+
+    Some models encode tool calls as a JSON array in ``content`` instead of
+    populating the ``tool_calls`` field.  Each element is expected to have
+    ``type == "function"`` and a ``function`` object with ``name`` and
+    ``arguments``.  ``arguments`` may be a dict (Gemma) or a JSON string
+    (standard); both are normalised to a JSON string.
+
+    Returns a list of :class:`ChatCompletionMessageFunctionToolCall` objects,
+    or ``None`` if *content* does not match the expected format.
+    """
+    if not content or not content.strip().startswith("["):
+        return None
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+
+    if isinstance(parsed, list):
+        return _parse_item(parsed)
+
+    return None
+
+
+class Agent:
+    """LLM agent that maintains conversation history and dispatches tool calls.
+
+    Await ``arun()`` with a user message to get the assistant's reply, or use
+    ``astream()`` to receive events as they are produced::
+
+        config = AgentConfig(system_prompt="You are a helpful assistant.", model="anthropic/claude-haiku-4-5")
+        agent = Agent(config, memory=None)
+        reply = await agent.arun("List the skills available.")
+    """
+
+    def __init__(self, config: AgentConfig, memory: Memory | None) -> None:
+        self._model = config.model
+        self._max_retries = config.max_retries
+        self._max_tokens = config.max_tokens
+        self._tool_timeout = config.tool_timeout
+        self._max_tool_output = config.max_tool_output
+        self._memory = memory
+        self._reasoning_effort = config.reasoning_effort
+        self._session_id = config.session_id
+        skills_dir = config.skills_dir if config.skills_dir is not None else default_skills_dir()
+        self._skills_dir = skills_dir
+        self._disabled_builtin_tools = config.disabled_builtin_tools
+        self._registry = SkillRegistry(config.model)
+        self._registry_loaded = False
+        self._builtins = get_builtin_tools(skills_dir, memory, config.disabled_builtin_tools, config.tool_timeout, self._registry)
+        memory_schemas = get_memory_schemas() if memory is not None else []
+        active_builtin_schemas = [s for s in BUILTIN_SCHEMAS if s["function"]["name"] not in config.disabled_builtin_tools]
+        active_memory_schemas = [s for s in memory_schemas if s["function"]["name"] not in config.disabled_builtin_tools]
+        self._tools: list[dict] = active_builtin_schemas + active_memory_schemas
+        self._tool_name_set: set[str] = {t["function"]["name"] for t in self._tools}
+        self._tool_kwargs: dict = {"tools": self._tools, "tool_choice": "auto"} if self._tools else {}
+        self._messages: list[dict] = []
+        if config.system_prompt:
+            self._messages.append({"role": "system", "content": config.system_prompt})
+            logger.debug("[system]\n%s", config.system_prompt)
+
+    @property
+    def tool_names(self) -> list[str]:
+        return [t["function"]["name"] for t in self._tools]
+
+    @property
+    def messages(self) -> list[dict]:
+        """Read-only view of the current conversation history."""
+        return list(self._messages)
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def __repr__(self) -> str:
+        return f"Agent(model={self._model!r}, tools={self.tool_names!r})"
+
+    async def astream(self, user_input: str) -> AsyncGenerator[AgentEvent, None]:
+        """Stream events produced while processing *user_input*.
+
+        Yields :class:`TokenEvent` for each partial LLM token,
+        :class:`ToolStartEvent` / :class:`ToolDoneEvent` around each tool call,
+        and a final :class:`DoneEvent` when the agent is done.
+        """
+        self._messages.append({"role": "user", "content": user_input})
+        logger.debug("[user]\n%s", user_input)
+        if self._memory is not None:
+            self._memory.store("user", user_input)
+
+        if not self._registry_loaded:
+            await self._registry.load_skills_dir(self._skills_dir)
+            self._registry_loaded = True
+
+        last_fail_key: str | None = None
+        consecutive_failures = 0
+        model_turns = 0
+        tool_calls_executed = 0
+        started_at = time.monotonic()
+
+        while True:
+            if model_turns >= _MAX_MODEL_TURNS_PER_REQUEST:
+                raise RuntimeError(f"aborted: exceeded {_MAX_MODEL_TURNS_PER_REQUEST} model turns in a single request")
+            if time.monotonic() - started_at >= _MAX_RUN_SECONDS_PER_REQUEST:
+                raise RuntimeError(f"aborted: exceeded {_MAX_RUN_SECONDS_PER_REQUEST}s runtime in a single request")
+
+            stream = await _acompletion_with_retry(
+                self._model,
+                self._messages,
+                self._tool_kwargs,
+                self._max_retries,
+                self._max_tokens,
+                self._reasoning_effort,
+            )
+            model_turns += 1
+
+            # Accumulate streaming response.
+            content_parts: list[str] = []
+            tool_call_acc: dict[int, dict] = {}  # index → {id, name, arguments}
+            usage = None
+
+            async for chunk in stream:
+                if not chunk.choices:
+                    if chunk.usage is not None:
+                        usage = chunk.usage
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    content_parts.append(delta.content)
+                    yield TokenEvent(delta.content)
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_call_acc:
+                            tool_call_acc[idx] = {"id": tc_delta.id or "", "name": "", "arguments": ""}
+                        if tc_delta.function:
+                            tool_call_acc[idx]["name"] += tc_delta.function.name or ""
+                            tool_call_acc[idx]["arguments"] += tc_delta.function.arguments or ""
+                if chunk.usage is not None:
+                    usage = chunk.usage
+
+            content = "".join(content_parts)
+            logger.debug("[model_response] content=%r tool_calls=%d", content[:120], len(tool_call_acc))
+
+            if self._memory is not None and usage is not None:
+                self._memory.record_token_usage(
+                    self._session_id or "",
+                    "main",
+                    self._model,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                )
+
+            # Support models that embed tool calls as a JSON array in content.
+            content_tool_calls = None
+            if not tool_call_acc and content:
+                content_tool_calls = _parse_content_tool_calls(content)
+
+            if tool_call_acc or content_tool_calls:
+                if tool_call_acc:
+                    sorted_tcs = [tool_call_acc[i] for i in sorted(tool_call_acc)]
+                    assistant_msg: dict = {
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": [
+                            {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                            }
+                            for tc in sorted_tcs
+                        ],
+                    }
+                    tool_calls_to_run = [
+                        ChatCompletionMessageFunctionToolCall(
+                            id=tc["id"],
+                            type="function",
+                            function=Function(name=tc["name"], arguments=tc["arguments"]),
+                        )
+                        for tc in sorted_tcs
+                    ]
+                else:
+                    assistant_msg = {"role": "assistant", "content": content}
+                    tool_calls_to_run = content_tool_calls  # type: ignore[assignment]
+
+                self._messages.append(assistant_msg)
+
+                for tc in tool_calls_to_run:
+                    if tool_calls_executed >= _MAX_TOOL_CALLS_PER_REQUEST:
+                        raise RuntimeError(f"aborted: exceeded {_MAX_TOOL_CALLS_PER_REQUEST} tool calls in a single request")
+                    tool_calls_executed += 1
+                    target = tc.function.name
+                    try:
+                        arguments = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError as e:
+                        result = _tool_error(f"malformed JSON arguments: {e}")
+                        logger.error("[tool_result] %s -> %s", target, result.output)
+                        self._messages.append({"role": "tool", "tool_call_id": tc.id, "content": result.output})
+                        continue
+
+                    logger.debug("[tool_call] %s args=%s", target, arguments)
+                    yield ToolStartEvent(name=target, args=arguments)
+
+                    if target not in self._tool_name_set:
+                        result = _tool_error(f"unknown tool: {target}")
+                    else:
+                        try:
+                            if target in self._builtins:
+                                raw = self._builtins[target](**arguments)
+                                if asyncio.iscoroutine(raw):
+                                    raw = await asyncio.wait_for(raw, timeout=self._tool_timeout)
+                                result = _tool_output(str(raw), self._max_tool_output)
+                            else:
+                                result = _tool_error(f"tool {target!r} has no executor")
+                        except TypeError as e:
+                            logger.error("argument type error when running tool %s: %s", target, e)
+                            result = _tool_error(f"argument type error: {e}")
+                        except Exception as e:
+                            logger.error("unexpected error when running tool %s: %s", target, e)
+                            result = _tool_error(f"unexpected error: {e}")
+
+                    logger.info("[tool_result] %s -> %s", target, result.output)
+                    yield ToolDoneEvent(name=target, output=result.output, is_error=result.is_error)
+
+                    self._messages.append({"role": "tool", "tool_call_id": tc.id, "content": result.output})
+
+                    call_key = f"{target}:{tc.function.arguments}"
+                    if result.is_error and call_key == last_fail_key:
+                        consecutive_failures += 1
+                    elif result.is_error:
+                        last_fail_key = call_key
+                        consecutive_failures = 1
+                    else:
+                        last_fail_key = None
+                        consecutive_failures = 0
+
+                if consecutive_failures >= _MAX_REPEATED_FAILURES:
+                    hint = (
+                        "You have repeated the same failing tool call "
+                        f"{consecutive_failures} times. The arguments appear to be "
+                        "incorrect. Try a different approach: rewrite the affected lines, break the "
+                        "task into smaller steps, or ask the user for help."
+                    )
+                    logger.warning("[repeated_failure_hint] %s", hint)
+                    self._messages.append({"role": "system", "content": hint})
+                    last_fail_key = None
+                    consecutive_failures = 0
+            else:
+                self._messages.append({"role": "assistant", "content": content})
+                logger.debug("[assistant]\n%s", content)
+                if self._memory is not None:
+                    self._memory.store("agent", content)
+                yield DoneEvent(content=content)
+                return
+
+    async def arun(self, user_input: str) -> str:
+        """Send *user_input* to the LLM and return the assistant's final reply.
+
+        Convenience wrapper around :meth:`astream` that discards intermediate
+        events and returns the final text.
+        """
+        async for event in self.astream(user_input):
+            if isinstance(event, DoneEvent):
+                return event.content
+        return ""
+
+
+class SessionNotFoundError(Exception):
+    pass
+
+
+class AgentManager:
+
+    def __init__(self):
+        self._sessions = {}
+
+    @staticmethod
+    def get_session_id() -> str:
+        return str(uuid4())
+
+    def create_session(self, config: AgentConfig, with_memory: bool = False) -> str:
+        session_id = self.get_session_id()
+
+        memory = None
+        if with_memory:
+            memory = self.init_memory(session_id)
+
+        agent = Agent(config._replace(session_id=session_id), memory)
+        self._sessions[session_id] = agent
+
+        return session_id
+
+    def get_agent(self, session_id: str) -> Agent:
+        try:
+            return self._sessions[session_id]
+        except KeyError:
+            raise SessionNotFoundError(f"Session with id {session_id} not found.")
+
+    async def arun_agent(self, session_id: str, message: str) -> str:
+        agent = self.get_agent(session_id)
+        return await agent.arun(message)
+
+    def astream_agent(self, session_id: str, message: str) -> AsyncGenerator[AgentEvent, None]:
+        agent = self.get_agent(session_id)
+        return agent.astream(message)
+
+    def export_conversation(self, session_id: str) -> Path | None:
+        agent = self.get_agent(session_id)
+        if agent.messages:
+            return export_conversation(agent.messages, agent.model)
+        return None
+
+    def get_token_stats(self, session_id: str) -> dict:
+        """Return aggregated token usage for *session_id*, or an empty dict when unavailable."""
+        agent = self.get_agent(session_id)
+        if agent._memory is None:
+            return {}
+        return agent._memory.get_session_stats(session_id)
+
+    def init_memory(self, session_id: str) -> Memory:
+        db_path = project_dir() / "memory.db"
+        return Memory(db_path)
