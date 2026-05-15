@@ -1,7 +1,7 @@
 [project]
 name = "mapache-agent"
 version = "0.1.0"
-description = "AI‑assistant‑as‑Makefile: a tool to create and manage AI agents using a Makefile."
+description = "Python AI agent framework extended by skills — Markdown instructions + callable Python tools."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -9,7 +9,7 @@ requires-python = ">=3.11"
 authors = [
     { name = "Dmitriy Sorochenkov" },
 ]
-keywords = ["ai", "agent", "makefile", "llm", "automation"]
+keywords = ["ai", "agent", "skills", "llm", "automation"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

@@ -41,7 +41,7 @@ class TestLoadSettings:
             result = load_settings()
         assert result == {"model": "mymodel"}
 
-    def test_makefile_key_is_ignored(self, tmp_path):
+    def test_legacy_key_is_ignored(self, tmp_path):
         (tmp_path / "settings.yaml").write_text("makefile: special.mk\n")
         with _patch_settings_file(tmp_path):
             result = load_settings()

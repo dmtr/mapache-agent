@@ -9,12 +9,14 @@ import sys
 import pytest
 
 MODEL = "anthropic/claude-haiku-4-5"
-MAKEFILE = "examples/orchestra.mk"
 
 
-def _run(prompt: str) -> subprocess.CompletedProcess:
+def _run(prompt: str, extra_args: list[str] | None = None) -> subprocess.CompletedProcess:
+    cmd = [sys.executable, "-m", "mapache_agent.main", "run", "--model", MODEL, "--prompt", prompt]
+    if extra_args:
+        cmd.extend(extra_args)
     return subprocess.run(
-        [sys.executable, "-m", "mapache_agent.main", "run", "-f", MAKEFILE, "--model", MODEL, "--prompt", prompt],
+        cmd,
         capture_output=True,
         text=True,
         timeout=60,
@@ -26,12 +28,11 @@ def test_list_available_tools():
     result = _run("What tools are available to you? Just list their names.")
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip(), "Expected non-empty output"
-    assert "list_agent" in result.stdout, "Expected 'list_agents' tool to be available"
+    assert "list_skills" in result.stdout, "Expected 'list_skills' tool to be available"
 
 
 @pytest.mark.e2e
-def test_list_available_agents():
-    result = _run("List available agents.")
+def test_list_available_skills():
+    result = _run("List available skills.", extra_args=["--skills-dir", "examples"])
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip(), "Expected non-empty output"
-    assert "test-agent" in result.stdout, "Expected list of agents in output"
