@@ -249,8 +249,8 @@ wheels = [
 ]
 
 [[package]]
-name = "makefile-agent"
-version = "0.3.6"
+name = "mapache-agent"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "any-llm-sdk", extra = ["ollama"] },

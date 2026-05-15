@@ -1,6 +1,6 @@
 [project]
 name = "mapache-agent"
-version = "0.3.6"
+version = "0.1.0"
 description = "AI‑assistant‑as‑Makefile: a tool to create and manage AI agents using a Makefile."
 readme = "README.md"
 license = "MIT"
